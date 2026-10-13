@@ -1,0 +1,56 @@
+name: async-payments-test
+
+x-test-environment: &test-environment
+  API_KEY: local-test-api-key
+  DATABASE_URL: postgresql+asyncpg://payments_test:payments_test@postgres:5432/payments_test
+  TEST_DATABASE_URL: postgresql+asyncpg://payments_test:payments_test@postgres:5432/payments_test
+  RABBITMQ_URL: amqp://payments_test:payments_test@rabbitmq:5672/
+  TEST_RABBITMQ_URL: amqp://payments_test:payments_test@rabbitmq:5672/
+  RETRY_BASE_DELAY: 5
+  WEBHOOK_TIMEOUT: 10
+  OUTBOX_POLL_INTERVAL: 0.5
+  PUBLISH_TIMEOUT: 5
+  RECOVERY_DELAY: 2
+  GATEWAY_MIN_DELAY: 2
+  GATEWAY_MAX_DELAY: 5
+  LOG_LEVEL: WARNING
+
+services:
+  postgres:
+    image: postgres:16.15
+    environment:
+      POSTGRES_DB: payments_test
+      POSTGRES_USER: payments_test
+      POSTGRES_PASSWORD: payments_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments_test -d payments_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:4.2.9-management
+    hostname: payments-test-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: payments_test
+      RABBITMQ_DEFAULT_PASS: payments_test
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 2s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  tests:
+    image: async-payments:test
+    build:
+      context: .
+      target: test
+    init: true
+    environment: *test-environment
+    command: ["sh", "-c", "alembic upgrade head && python -m pytest -q -p no:cacheprovider"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
