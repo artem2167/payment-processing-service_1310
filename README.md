@@ -1,70 +1,99 @@
 # Асинхронный сервис платежей
 
-FastAPI принимает платеж, PostgreSQL сохраняет его вместе с событием outbox, а один consumer RabbitMQ выполняет эмуляцию шлюза, сохраняет результат и отправляет webhook. Ответ `202 Accepted` подтверждает сохранение запроса; обработка продолжается в фоне.
+Сервис принимает платежи через FastAPI, сохраняет их в PostgreSQL и обрабатывает асинхронно через RabbitMQ.
+
+Платеж и outbox-событие создаются в одной транзакции. Consumer получает событие, эмулирует платежный шлюз, сохраняет результат и отправляет webhook.
 
 ```text
-POST → PostgreSQL: payment + outbox → 202
-                      ↓
-              relay в consumer
-                      ↓
-             RabbitMQ payments.new
-                      ↓
-          шлюз → результат в БД → webhook
-                      ↓
-              retry outbox / DLQ
+POST /api/v1/payments
+        |
+        v
+PostgreSQL
+payment + outbox
+        |
+        v
+RabbitMQ -> consumer -> gateway
+                      |
+                      v
+                  DB + webhook
 ```
 
-Стек: Python 3.12, FastAPI, Pydantic 2, SQLAlchemy 2.0 async, asyncpg, PostgreSQL 16, FastStream, RabbitMQ 4, Alembic. Прямые и транзитивные Python-зависимости зафиксированы в `uv.lock`. Образы инфраструктуры: `postgres:16.15`, `rabbitmq:4.2.9-management`; приложение собирается на `python:3.12.13-slim-bookworm`.
+## Стек
 
-## Запуск в Docker
+Python 3.12, FastAPI, Pydantic 2, SQLAlchemy async, asyncpg, PostgreSQL, RabbitMQ, FastStream, Alembic, Docker Compose, pytest.
 
-Нужны Docker Engine с Linux-контейнерами и Docker Compose v2. На Windows запустите Docker Desktop и дождитесь готовности движка. Команды ниже выполняются из корня проекта.
+## Возможности
+
+- асинхронная обработка платежей;
+- идемпотентность по `Idempotency-Key`;
+- transactional outbox;
+- webhook с retry;
+- DLQ для неуспешных сообщений;
+- восстановление обработки после рестартов;
+- интеграционные тесты с PostgreSQL и RabbitMQ.
+
+## Запуск
+
+Нужны Docker и Docker Compose v2.
 
 ```powershell
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 docker compose --profile demo up -d --build
-docker compose ps -a
-docker compose logs -f api consumer
+docker compose ps
 ```
 
-В `.env.example` приведены открытые значения для локальной демонстрации. Для другого окружения замените API-ключ, логины и пароли. При изменении учетных данных также обновите `DATABASE_URL` и `RABBITMQ_URL`; специальные символы в URL нужно кодировать. При существующих volumes изменение `POSTGRES_PASSWORD` или `RABBITMQ_DEFAULT_PASS` не меняет уже созданных пользователей.
-
-Compose сначала дожидается готовности PostgreSQL, выполняет `alembic upgrade head` отдельным одноразовым сервисом `migrate`, затем запускает API и consumer. Consumer дополнительно дожидается готовности RabbitMQ. API проверяет доступность БД; доступность брокера не обязательна для приема платежа в outbox.
-
-Четыре основных сервиса — `postgres`, `rabbitmq`, `api`, `consumer`. `migrate` только применяет схему. Профиль `demo` добавляет отдельный приемник webhook; для запуска без демонстрационного приемника используйте `docker compose up -d --build`.
-
-Локальные адреса при стандартных портах из `.env.example`:
+Основные адреса:
 
 | Сервис | Адрес |
 | --- | --- |
 | API | `http://localhost:8000` |
-| Readiness API | `http://localhost:8000/health`, нужен `X-API-Key` |
-| RabbitMQ Management | `http://localhost:15672`, логин/пароль из `.env` |
-| Webhook-приемник | `http://localhost:8080/events` |
-| PostgreSQL | `localhost:5432` |
+| Health | `http://localhost:8000/health` |
+| RabbitMQ Management | `http://localhost:15672` |
+| Demo webhook receiver | `http://localhost:8080/events` |
 
-Порты привязаны к `127.0.0.1`. Их можно изменить через `.env`; если порт API занят, задайте, например, `API_PORT=18000`. В этом случае API доступен на `http://localhost:18000`. Для webhook внутри Compose используется имя `webhook-receiver`; `localhost` в consumer указывает на сам контейнер consumer.
+Порты и credentials можно изменить в `.env`.
+
+Без demo receiver:
+
+```bash
+docker compose up -d --build
+```
 
 ## API
 
-Каждый маршрут платежного API, включая `/health` и ответы на неизвестные пути, требует заголовок `X-API-Key`. Автоматические `/docs`, `/redoc`, `/openapi.json` отключены.
+Все маршруты требуют заголовок:
 
-### Создать платеж
-
-`POST /api/v1/payments` требует `Idempotency-Key`. Пример подготовлен в `examples/payment.json`.
-
-```powershell
-$apiKey = (Get-Content .env | Where-Object { $_ -match '^API_KEY=' }) -replace '^API_KEY=', ''
-$apiPort = (Get-Content .env | Where-Object { $_ -match '^API_PORT=' }) -replace '^API_PORT=', ''
-if (-not $apiPort) { $apiPort = '8000' }
-$apiUrl = "http://localhost:$apiPort"
-$headers = @{ 'X-API-Key' = $apiKey; 'Idempotency-Key' = 'order-1001' }
-$body = Get-Content examples/payment.json -Raw -Encoding UTF8
-$payment = Invoke-RestMethod -Method Post -Uri "$apiUrl/api/v1/payments" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
-$payment
+```text
+X-API-Key: <API_KEY>
 ```
 
-Успешный ответ — `202`:
+### Создание платежа
+
+```http
+POST /api/v1/payments
+```
+
+Также нужен заголовок:
+
+```text
+Idempotency-Key: order-1001
+```
+
+Пример тела:
+
+```json
+{
+  "amount": "1500.00",
+  "currency": "RUB",
+  "description": "Order #1001",
+  "metadata": {
+    "order_id": "1001"
+  },
+  "webhook_url": "http://webhook-receiver:8080/webhook"
+}
+```
+
+Успешный ответ:
 
 ```json
 {
@@ -74,52 +103,52 @@ $payment
 }
 ```
 
-| Поле | Правило |
-| --- | --- |
-| `amount` | Положительное число или decimal-строка, до 18 цифр всего и 2 после точки; `bool`, NaN/Infinity и лишние дробные знаки отклоняются. Рекомендуется строка `"1500.00"` |
-| `currency` | `RUB`, `USD`, `EUR` |
-| `description` | Обязательная корректная Unicode-строка длиной 1–1000 символов, без нулевого символа |
-| `metadata` | JSON-объект, по умолчанию `{}`, до 16 KiB в компактном UTF-8 представлении; NaN/Infinity и нулевой символ отклоняются |
-| `webhook_url` | Обязательный URL с `http` или `https`, до 2048 символов |
-| `Idempotency-Key` | Обязательный заголовок длиной 1–255 символов, строка из пробелов отклоняется |
+HTTP status: `202 Accepted`.
 
-Ключ глобально уникален и не истекает. Повтор с тем же нормализованным телом возвращает `202`, прежние `payment_id`/`created_at` и текущий статус. Например, суммы `1500` и `"1500.00"` эквивалентны; порядок ключей metadata не влияет на сравнение. Новые платеж и событие не создаются, включая конкурентные запросы. То же значение ключа с другим телом возвращает `409`.
+Поддерживаемые валюты: `RUB`, `USD`, `EUR`.
 
-JSON-число в `amount` читается из исходного текста запроса как Decimal: даже большая допустимая сумма не округляется через binary float. Если клиент сам сериализует деньги из float, утраченные на его стороне цифры восстановить нельзя; decimal-строка остается удобным способом передачи точной суммы.
+Для денежных значений используется `Decimal`, чтобы избежать ошибок округления.
 
-```powershell
-# Повтор: тот же payment_id, новое событие не создается.
-Invoke-RestMethod -Method Post -Uri "$apiUrl/api/v1/payments" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
+### Idempotency
 
-# Конфликт: ожидается HTTP 409.
-$changed = $body | ConvertFrom-Json
-$changed.amount = '1501.00'
-Invoke-RestMethod -Method Post -Uri "$apiUrl/api/v1/payments" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes(($changed | ConvertTo-Json -Depth 20)))
+Если повторить запрос с тем же `Idempotency-Key` и тем же телом, сервис вернет существующий платеж.
+
+Если использовать тот же ключ с другим телом, API вернет `409 Conflict`.
+
+Конкурентные запросы с одинаковым ключом защищены уникальным ограничением PostgreSQL.
+
+### Получение платежа
+
+```http
+GET /api/v1/payments/{payment_id}
 ```
 
-### Получить платеж
+Ответ содержит сумму, валюту, описание, metadata, статус, даты обработки и состояние доставки webhook.
 
-```powershell
-Invoke-RestMethod -Uri "$apiUrl/api/v1/payments/$($payment.payment_id)" -Headers @{ 'X-API-Key' = $apiKey }
-```
-
-`GET /api/v1/payments/{payment_id}` возвращает `payment_id`, `amount` как строку с двумя дробными знаками, `currency`, `description`, `metadata`, `status`, `idempotency_key`, `webhook_url`, `created_at`, `processed_at` и `delivery` с полями `delivered_at`/`exhausted_at`. Даты хранятся в UTC и возвращаются в ISO 8601. До обработки `processed_at` равен `null`.
+Основные HTTP-коды:
 
 | Код | Причина |
 | --- | --- |
-| `401` | API-ключ отсутствует или неверен |
-| `404` | Платеж с корректным UUID не найден |
-| `409` | Idempotency-Key уже использован с другим телом |
-| `422` | Некорректное тело, UUID или Idempotency-Key |
-| `503` | База данных недоступна |
+| `401` | неверный или отсутствующий API key |
+| `404` | платеж не найден |
+| `409` | конфликт `Idempotency-Key` |
+| `422` | ошибка валидации |
+| `503` | PostgreSQL недоступен |
 
-При ошибке разбора JSON или валидации Pydantic ответ `422` содержит `detail` — список ошибок с `type`, `loc` и `msg`. Исходное значение поля и внутренний контекст исключения в ответ не включаются. Некорректный Unicode безопасно представляется в диагностике. Нестандартные JSON-константы `NaN`, `Infinity` и `-Infinity` отклоняются как `json_invalid`; бесконечные значения, полученные из слишком большого показателя степени, не принимаются в платеж или metadata. Отдельная проверка `Idempotency-Key`, состоящего только из пробельных символов, возвращает `422` со строкой `detail: "Idempotency-Key must not be blank"`.
+## Обработка платежа
 
-## Шлюз, webhook и повторы
+После создания платеж имеет статус `pending`.
 
-Шлюз эмулируется асинхронной задержкой 2–5 секунд: в 90% случаев результат `succeeded`, в 10% — `failed`. `failed` означает бизнес-отказ шлюза; он также сохраняется с `processed_at` и отправляется получателю webhook. Сетевая ошибка уведомления не меняет сохраненный статус платежа.
+Consumer получает сообщение из RabbitMQ и вызывает эмулятор шлюза. Эмулятор работает с задержкой 2–5 секунд:
 
-Webhook — POST с JSON:
+- около 90% запросов завершаются со статусом `succeeded`;
+- около 10% — `failed`.
+
+Результат сохраняется в PostgreSQL вместе с `processed_at`.
+
+## Webhook
+
+После обработки платежа отправляется событие:
 
 ```json
 {
@@ -129,154 +158,203 @@ Webhook — POST с JSON:
   "status": "succeeded",
   "amount": "1500.00",
   "currency": "RUB",
-  "metadata": {"order_id": "1001"},
+  "metadata": {
+    "order_id": "1001"
+  },
   "created_at": "2026-10-13T09:00:00Z",
   "processed_at": "2026-10-13T09:00:03Z"
 }
 ```
 
-`event_id` стабилен для платежа и одинаков во всех повторах; он также передается в заголовке `Webhook-Event-Id`. Получатель должен дедуплицировать уведомления по нему. Успешным считается любой HTTP `2xx`. Сетевые ошибки, timeout и остальные HTTP-коды вызывают повтор. Перенаправления не выполняются. Общий timeout запроса по умолчанию — 10 секунд.
+`event_id` одинаковый для всех повторов одного события и также передается в заголовке `Webhook-Event-Id`.
 
-Всего предусмотрены **три логические попытки**, включая первую: при ошибке попытки 1 событие следующей попытки записывается в outbox с задержкой 5 секунд, при ошибке попытки 2 — с задержкой 10 секунд. Формула: `RETRY_BASE_DELAY * 2 ** (attempt_no - 1)` после неуспешной попытки. Отложенная публикация использует `outbox.available_at`; фактический старт может быть позднее из-за интервала relay и нагрузки. После третьей ошибки фиксируется исчерпание обработки и создается событие для `payments.dlq`.
+Любой ответ `2xx` считается успешной доставкой.
 
-Номер попытки и переход retry/DLQ сохраняются в БД одной транзакцией до ACK исходного сообщения. Повтор старого сообщения не создает новую попытку. При уже сохраненном результате шлюз повторно не разыгрывается; при сохраненной доставке новый HTTP-запрос не выполняется. Если технический сбой исчерпал попытки до результата шлюза, платеж может остаться `pending` с `delivery.exhausted_at`; техническая ошибка не выдается за бизнес-отказ.
+При ошибке выполняются три попытки:
 
-### Приемник для демонстрации
+```text
+attempt 1
+   |
+   | 5 sec
+   v
+attempt 2
+   |
+   | 10 sec
+   v
+attempt 3
+   |
+   v
+payments.dlq
+```
 
-В профиле `demo` доступны маршруты:
+Webhook доставляется с семантикой `at-least-once`, поэтому получателю рекомендуется дедуплицировать события по `event_id`.
 
-| URL в `webhook_url` | Ответ |
+## Transactional Outbox
+
+Платеж и первое outbox-событие создаются в одной транзакции PostgreSQL.
+
+После commit relay публикует событие в RabbitMQ. Если брокер временно недоступен, событие остается в outbox и будет опубликовано после восстановления соединения.
+
+Это позволяет принимать платежи даже при временной недоступности RabbitMQ и не терять события между БД и брокером.
+
+## RabbitMQ
+
+Используются две основные очереди:
+
+```text
+payments.events -> payments.new -> consumer
+
+payments.dlx -> payments.dlq
+```
+
+Очереди durable, сообщения публикуются persistent.
+
+По условиям задания одновременно активен один consumer.
+
+Посмотреть состояние очередей:
+
+```bash
+docker compose exec rabbitmq rabbitmqctl list_queues   name messages_ready messages_unacknowledged
+```
+
+Или через RabbitMQ Management:
+
+```text
+http://localhost:15672
+```
+
+## Demo webhook receiver
+
+При запуске с профилем `demo` доступны готовые сценарии:
+
+| URL | Поведение |
 | --- | --- |
-| `http://webhook-receiver:8080/webhook` | Всегда `204` |
-| `http://webhook-receiver:8080/flaky` | Два первых запроса одного `event_id` — `500`, затем `204` |
-| `http://webhook-receiver:8080/fail` | Всегда `500`; сценарий трех попыток и DLQ |
-| `http://webhook-receiver:8080/slow` | `204` через 20 секунд; при стандартном timeout вызывает retry/DLQ |
+| `/webhook` | всегда `204` |
+| `/flaky` | два раза `500`, затем `204` |
+| `/fail` | всегда `500` |
+| `/slow` | отвечает с задержкой |
 
-Приемник показывает до 1000 последних запросов: `GET http://localhost:8080/events`, включая тело, `event_id`, путь, время и номер запроса данного события. Состояние хранится в памяти и сбрасывается при рестарте. `DELETE /events` очищает журнал и счетчики.
+Пример URL внутри Compose:
 
-Для другого сценария измените `webhook_url` в JSON и используйте **новый** Idempotency-Key:
-
-```powershell
-$retryBody = $body | ConvertFrom-Json
-$retryBody.webhook_url = 'http://webhook-receiver:8080/flaky'
-$retryHeaders = @{ 'X-API-Key' = $apiKey; 'Idempotency-Key' = 'flaky-1001' }
-$retryPayment = Invoke-RestMethod -Method Post -Uri "$apiUrl/api/v1/payments" -Headers $retryHeaders -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes(($retryBody | ConvertTo-Json -Depth 20)))
-Invoke-RestMethod -Uri http://localhost:8080/events
+```text
+http://webhook-receiver:8080/webhook
+http://webhook-receiver:8080/flaky
+http://webhook-receiver:8080/fail
+http://webhook-receiver:8080/slow
 ```
 
-## Outbox и гарантии доставки
+История запросов:
 
-Создание платежа и исходного outbox-события — одна транзакция PostgreSQL. Relay внутри consumer публикует готовые события с persistent delivery, publisher confirms и обязательной маршрутизацией. Только подтвержденная маршрутизированная публикация получает `published_at`. Недоступный брокер оставляет работу в outbox; повтор публикации учитывает `available_at` и техническую задержку, не расходуя бюджет трех попыток обработки.
-
-Durable direct exchange `payments.events` связан с durable очередью `payments.new` по routing key `payments.new`; `payments.dlx` связан с `payments.dlq` по routing key `payments.dlq`. В рабочем процессе один платежный subscriber и prefetch 1. Очередь использует `x-single-active-consumer`: при запуске второго worker активным остается один обработчик, второй ждет. Relay — фоновая задача того же процесса.
-
-Сохраненные события доставляются **at least once** при последующем восстановлении инфраструктуры: авария после confirm до фиксации `published_at` допускает повторную публикацию. Consumer распознает уже выполненные переходы по состоянию БД. Недоступность БД не подтверждает незавершенное сообщение; worker восстанавливает соединение с задержкой.
-
-HTTP-вызов и транзакцию БД нельзя объединить. Авария после ответа `2xx`, но до сохранения `delivered_at`, допускает повтор webhook с тем же `event_id` в той же логической попытке. Поэтому при произвольных авариях число физических HTTP-запросов может быть больше трех. При постоянно недоступном получателе доставка исчерпывается в DLQ; гарантировать успешное HTTP-получение при конечном бюджете попыток нельзя.
-
-Поврежденные сообщения помещаются в диагностический карантин DLQ. Автоматический возврат DLQ в `payments.new` не выполняется.
-
-### Посмотреть очереди и DLQ
-
-Откройте [RabbitMQ Management](http://localhost:15672), войдите с учетными данными из `.env`, выберите **Queues and Streams** → `payments.dlq`. Для просмотра используйте **Get messages** с режимом **Nack message requeue true**: сообщение останется в очереди. В **Exchanges** видны `payments.events` и `payments.dlx` с bindings.
-
-```powershell
-docker compose exec rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged
-docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT id, status, current_attempt, webhook_delivered_at, exhausted_at, last_error FROM payments ORDER BY created_at DESC LIMIT 10;"'
-docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT payment_id, event_type, attempt_no, routing_key, available_at, published_at, publish_attempts FROM outbox ORDER BY created_at DESC LIMIT 10;"'
+```text
+GET http://localhost:8080/events
 ```
 
-При разборе DLQ сначала проверьте ошибку, состояние платежа и приемника. Повторная отправка исходного сообщения исчерпанного платежа сама по себе не сбрасывает попытки. Административное возобновление обработки требует отдельного осознанного изменения состояния; endpoint для такого действия в задании не предусмотрен.
+## Проверка восстановления
 
-### Проверить отключение брокера и рестарт
+Можно остановить RabbitMQ:
 
-```powershell
+```bash
 docker compose stop rabbitmq
-# Создайте платеж через POST с новым Idempotency-Key: он сохранится с 202.
+```
+
+После этого создать платеж. API сохранит его и вернет `202`.
+
+После восстановления брокера:
+
+```bash
 docker compose start rabbitmq
-# После восстановления посмотрите GET, журнал приемника и outbox.
+```
+
+relay опубликует сохраненное событие, и обработка продолжится.
+
+Consumer также можно перезапустить без потери состояния:
+
+```bash
 docker compose restart consumer
 ```
 
-Остановка broker не удаляет outbox. Рестарт consumer не сбрасывает попытки и сохраненный результат. Named volumes сохраняют данные PostgreSQL и RabbitMQ между обычными остановками и перезапусками.
+Для автоматической проверки recovery-сценариев:
 
-Для автоматической проверки восстановления на запущенном Compose с профилем `demo`:
-
-В командах ниже `$apiUrl` — адрес из примера создания платежа; в новом терминале можно передать адрес напрямую, например `--api http://localhost:18000`.
-
-```powershell
-uv run --frozen python -m scripts.resilience --api $apiUrl
+```bash
+uv run --frozen python -m scripts.resilience --api http://localhost:8000
 ```
 
-Скрипт временно останавливает RabbitMQ проекта `async-payments`, создает новый платеж и проверяет `202`/`pending`, восстанавливает брокер и дожидается доставки. Затем повторяет сценарий с остановленным consumer. После перезапуска PostgreSQL проверяет готовность существующего API и доставку нового платежа существующим consumer, без их перезапуска. Отдельный последующий рестарт API/consumer проверяет сохранность ID, результатов и дат доставки. Используются только новые ключи; существующие платежи, очередь и журнал приемника не очищаются. При ошибке или прерывании скрипт пытается запустить остановленные им сервисы. Запускайте отдельно от других проверок, поскольку они используют те же контейнеры.
+## Тесты
 
-## Настройки
+Интеграционные тесты запускаются в отдельном Compose-окружении:
 
-| Переменная | Значение по умолчанию / назначение |
-| --- | --- |
-| `API_KEY` | Обязательный статический API-ключ |
-| `DATABASE_URL` | Async URL PostgreSQL; обязателен в `.env` для Compose, при прямом запуске Python по умолчанию локальная БД `payments` |
-| `RABBITMQ_URL` | AMQP URL; обязателен в `.env` для Compose, при прямом запуске Python по умолчанию локальный брокер с пользователем `payments` |
-| `RETRY_BASE_DELAY` | `5`, базовая задержка retry в секундах |
-| `WEBHOOK_TIMEOUT` | `10`, общий предел HTTP-запроса |
-| `OUTBOX_POLL_INTERVAL` | `0.5`, интервал проверки готовых событий |
-| `PUBLISH_TIMEOUT` | `5`, timeout публикации в брокер |
-| `RECOVERY_DELAY` | `2`, пауза перед восстановлением worker |
-| `GATEWAY_MIN_DELAY` / `GATEWAY_MAX_DELAY` | `2` / `5`, границы задержки эмуляции |
-| `LOG_LEVEL` | `INFO` |
-| `API_PORT` | `8000`, порт API на хосте в Compose |
-| `WEBHOOK_RECEIVER_PORT` | `8080`, порт демонстрационного приемника на хосте |
-| `POSTGRES_PORT` / `RABBITMQ_PORT` / `RABBITMQ_MANAGEMENT_PORT` | `5432` / `5672` / `15672`, инфраструктурные порты на хосте |
+```bash
+docker compose -f compose.test.yaml up   --build   --abort-on-container-exit   --exit-code-from tests   tests
+```
 
-Измененные настройки применяются при пересоздании приложения: `docker compose up -d api consumer`. Логи содержат идентификаторы и этап обработки; секреты и полный webhook URL в них не записываются.
+После выполнения:
 
-## Тесты и локальная разработка
-
-Тесты работают с настоящими PostgreSQL и RabbitMQ для транзакций, конкуренции и маршрутизации. Отдельный Compose-проект тестов не использует volumes демонстрационного сервиса и не публикует инфраструктурные порты на хост:
-
-```powershell
-docker compose -f compose.test.yaml up --build --abort-on-container-exit --exit-code-from tests tests
+```bash
 docker compose -f compose.test.yaml down -v
 ```
 
-Контейнер `tests` сначала применяет миграции, затем запускает pytest; он использует Docker target `test` с зависимостями для разработки. Интеграционные тесты создают отдельную временную схему PostgreSQL и удаляют только ее. Отсутствие `TEST_DATABASE_URL`/`TEST_RABBITMQ_URL` вне этого окружения приводит к пропуску соответствующих интеграционных тестов.
+Локально:
 
-Для запуска на хосте нужен Python 3.12+ и [uv](https://docs.astral.sh/uv/getting-started/installation/):
-
-```powershell
+```bash
 uv sync --frozen
 uv run --frozen pytest -q
 uv run --frozen ruff check .
 ```
 
-После запуска Compose с профилем `demo` можно проверить HTTP-сценарии одной командой:
+Smoke-проверка работающего сервиса:
 
-```powershell
-uv run --frozen python -m scripts.smoke --api $apiUrl
+```bash
+uv run --frozen python -m scripts.smoke --api http://localhost:8000
 ```
 
-Проверка создает три новых платежа с уникальными ключами; проверяет авторизацию, 20 конкурентных повторов, конфликт ключа, доставку `/webhook`, три HTTP-запроса `/flaky` и исчерпание `/fail`, стабильность `event_id` и интервалы не меньше 5/10 секунд. Она читает состояние платежей и журнал приемника, не очищая существующие записи. Содержимое DLQ дополнительно можно посмотреть в Management. При измененных портах используйте `--api`/`--receiver`; для локального worker задайте `--webhook-target http://localhost:8080`.
+## Основные настройки
 
-Результаты выполненных проверок и матрица покрытия требований приведены в [VERIFICATION.md](VERIFICATION.md).
+| Переменная | Назначение |
+| --- | --- |
+| `API_KEY` | ключ доступа к API |
+| `DATABASE_URL` | подключение к PostgreSQL |
+| `RABBITMQ_URL` | подключение к RabbitMQ |
+| `RETRY_BASE_DELAY` | базовая задержка retry |
+| `WEBHOOK_TIMEOUT` | timeout webhook |
+| `OUTBOX_POLL_INTERVAL` | интервал polling outbox |
+| `PUBLISH_TIMEOUT` | timeout публикации |
+| `RECOVERY_DELAY` | задержка восстановления worker |
+| `GATEWAY_MIN_DELAY` | минимальная задержка шлюза |
+| `GATEWAY_MAX_DELAY` | максимальная задержка шлюза |
+| `LOG_LEVEL` | уровень логирования |
 
-Архив исходников и его SHA-256 собираются командой `python -m scripts.package` в каталоге `output`. Состав задан явно: приложение, миграции, тесты, примеры, служебные скрипты, конфигурация, README и отчет о проверках.
+Пример значений находится в `.env.example`.
 
-Для локального API/consumer сначала поднимите инфраструктуру `docker compose up -d --wait postgres rabbitmq`, затем задайте URL с `localhost` вместо имен контейнеров. При измененных портах/credentials подставьте значения своего `.env`:
+## Локальный запуск
+
+Можно поднять только PostgreSQL и RabbitMQ:
+
+```bash
+docker compose up -d --wait postgres rabbitmq
+```
+
+После настройки переменных окружения:
 
 ```powershell
-$env:API_KEY = $apiKey
-$env:DATABASE_URL = 'postgresql+asyncpg://payments:payments@localhost:5432/payments'
-$env:RABBITMQ_URL = 'amqp://payments:payments@localhost:5672/'
 uv run --frozen alembic upgrade head
-uv run --frozen uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000
-# В другом терминале с теми же переменными:
+
+uv run --frozen uvicorn app.main:create_app   --factory   --host 127.0.0.1   --port 8000
+```
+
+Consumer запускается отдельно:
+
+```bash
 uv run --frozen python -m app.worker
 ```
 
-Для интеграционных тестов на хосте также задайте `TEST_DATABASE_URL` и `TEST_RABBITMQ_URL`. Не запускайте локальный worker одновременно с Compose consumer для одной демонстрации. Webhook для локального worker должен указывать на адрес, доступный с хоста, например `http://localhost:8080/webhook`.
+## Ограничения
 
-## Остановка и ограничения
+В проекте используется эмулятор платежного шлюза — реальных списаний нет.
 
-`docker compose down` останавливает сервисы с сохранением named volumes. **`docker compose down -v` удаляет все платежи и состояние RabbitMQ этого Compose-проекта**; используйте только для осознанной очистки локальных данных. После очистки следующий запуск снова применит миграции.
+В рамках задания также не реализованы:
 
-Сервис использует эмулятор, реальных списаний нет. Статический API-ключ представляет одного клиента; ключи идемпотентности не имеют срока истечения. Последовательная обработка одного consumer выбрана по ТЗ; внешние шлюз, подпись webhook, административный redrive, мониторинг и горизонтальное масштабирование здесь не реализованы.
+- подпись webhook;
+- административный redrive из DLQ;
+- полноценные monitoring/metrics;
+- горизонтальное масштабирование обработки;
+- несколько API-клиентов.
